@@ -27,8 +27,10 @@ use {any_pointer, Error, MessageSize};
 use traits::{Pipelined, Owned};
 use private::capability::{ClientHook, ParamsHook, RequestHook, ResponseHook, ResultsHook};
 
-#[cfg(feature = "rpc")]
-use futures::Future;
+use std::future::{Future};
+use std::pin::{Pin};
+use std::marker::Unpin;
+use std::task::Poll;
 #[cfg(feature = "rpc_try")]
 use std::ops::Try;
 
@@ -37,22 +39,17 @@ use std::marker::PhantomData;
 /// A computation that might eventually resolve to a value of type `T` or to an error
 ///  of type `E`. Dropping the promise cancels the computation.
 #[must_use = "futures do nothing unless polled"]
-pub struct Promise<T, E> {
-    #[allow(dead_code)]
+pub struct Promise<T, E>  where T: Unpin, E: Unpin {
     inner: PromiseInner<T, E>,
 }
 
-enum PromiseInner<T, E> {
+enum PromiseInner<T, E> where T: Unpin, E: Unpin {
     Immediate(Result<T,E>),
-
-    #[cfg(feature = "rpc")]
-    Deferred(Box<Future<Item=T,Error=E> + 'static>),
-
-    #[cfg(feature = "rpc")]
+    Deferred(Box<Future<Output=::std::result::Result<T,E>> + 'static + Unpin>),
     Empty,
 }
 
-impl <T, E> Promise<T, E> {
+impl <T, E> Promise<T, E>  where T: Unpin, E: Unpin {
     pub fn ok(value: T) -> Promise<T, E> {
         Promise { inner: PromiseInner::Immediate(Ok(value)) }
     }
@@ -61,31 +58,27 @@ impl <T, E> Promise<T, E> {
         Promise { inner: PromiseInner::Immediate(Err(error)) }
     }
 
-    #[cfg(feature = "rpc")]
     pub fn from_future<F>(f: F) -> Promise<T, E>
-        where F: Future<Item=T,Error=E> + 'static
+        where F: Future<Output=::std::result::Result<T,E>> + 'static + Unpin
     {
         Promise { inner: PromiseInner::Deferred(Box::new(f)) }
     }
 }
 
-#[cfg(feature = "rpc")]
-impl <T, E> Future for Promise<T, E>
+impl <T, E> Future for Promise<T, E>  where T: Unpin, E: Unpin
 {
-    type Item = T;
-    type Error = E;
+    type Output = ::std::result::Result<T,E>;
 
-    fn poll(&mut self) -> ::futures::Poll<Self::Item, Self::Error> {
-        match self.inner {
+    fn poll(self: Pin<&mut Self>, lw: &mut ::std::task::Context) -> Poll<Self::Output> {
+        match self.get_mut().inner {
             PromiseInner::Empty => panic!("Promise polled after done."),
             ref mut imm @ PromiseInner::Immediate(_) => {
                 match ::std::mem::replace(imm, PromiseInner::Empty) {
-                    PromiseInner::Immediate(Ok(v)) => Ok(::futures::Async::Ready(v)),
-                    PromiseInner::Immediate(Err(e)) => Err(e),
+                    PromiseInner::Immediate(r) => Poll::Ready(r),
                     _ => unreachable!(),
                 }
             }
-            PromiseInner::Deferred(ref mut f) => f.poll(),
+            PromiseInner::Deferred(ref mut f) => Pin::new(f).poll(lw),
         }
     }
 }
@@ -109,7 +102,7 @@ impl<T> Try for Promise<T, crate::Error> {
 
 /// A promise for a result from a method call.
 #[must_use]
-pub struct RemotePromise<Results> where Results: Pipelined + for<'a> Owned<'a> + 'static {
+pub struct RemotePromise<Results> where Results: Pipelined + for<'a> Owned<'a> + 'static + Unpin {
     pub promise: Promise<Response<Results>, ::Error>,
     pub pipeline: Results::Pipeline,
 }
@@ -153,17 +146,65 @@ impl <Params, Results> Request<Params, Results>
     }
 }
 
-#[cfg(feature = "rpc")]
+mod map {
+    // map implementation borrowed from the futures-util crate.
+
+    use std::marker::Unpin;
+    use std::pin::Pin;
+    use std::future::Future;
+    use std::task::{Poll};
+
+    /// Future for the `map` combinator, changing the type of a future.
+    ///
+    /// This is created by the `Future::map` method.
+    #[derive(Debug)]
+    #[must_use = "futures do nothing unless polled"]
+    pub struct Map<Fut, F> {
+        future: Fut,
+        f: Option<F>,
+    }
+
+    impl<Fut, F> Map<Fut, F> {
+        pub(super) fn new(future: Fut, f: F) -> Map<Fut, F> {
+            Map { future, f: Some(f) }
+        }
+    }
+
+    impl<Fut: Unpin, F> Unpin for Map<Fut, F> {}
+
+    impl<Fut, F, T> Future for Map<Fut, F>
+        where Fut: Future,
+              F: FnOnce(Fut::Output) -> T,
+              Fut: Unpin
+    {
+        type Output = T;
+
+        fn poll(mut self: Pin<&mut Self>, lw: &mut ::std::task::Context) -> Poll<T> {
+            match Pin::new(&mut self.future).poll(lw) {
+                Poll::Pending => Poll::Pending,
+                Poll::Ready(output) => {
+                    let f = self.f.take()
+                        .expect("Map must not be polled after it returned `Poll::Ready`");
+                    Poll::Ready(f(output))
+                }
+            }
+        }
+    }
+}
+
 impl <Params, Results> Request <Params, Results>
-where Results: Pipelined + for<'a> Owned<'a> + 'static,
+where Results: Pipelined + for<'a> Owned<'a> + 'static + Unpin,
       <Results as Pipelined>::Pipeline: FromTypelessPipeline
 {
     pub fn send(self) -> RemotePromise<Results> {
         let RemotePromise {promise, pipeline, ..} = self.hook.send();
-        let typed_promise = Promise::from_future(promise.map(|response| {
-            Response {hook: response.hook,
-                      marker: PhantomData}
-        }));
+        let typed_promise = Promise::from_future(
+            self::map::Map::new(
+                promise,
+                |response: Result<Response<any_pointer::Owned>, Error> | -> Result<Response<Results>, Error> {
+                    Ok(Response {hook: response?.hook,
+                                 marker: PhantomData})
+                }));
         RemotePromise { promise: typed_promise,
                         pipeline: FromTypelessPipeline::new(pipeline)
                       }
@@ -242,7 +283,6 @@ impl Client {
     /// the capability promise is rejected).  This is mainly useful for error-checking in the case
     /// where no calls are being made.  There is no reason to wait for this before making calls; if
     /// the capability does not resolve, the call results will propagate the error.
-    #[cfg(feature = "rpc")]
     pub fn when_resolved(&self) -> Promise<(), Error> {
         self.hook.when_resolved()
     }
